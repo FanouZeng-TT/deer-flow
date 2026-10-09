@@ -4658,6 +4658,117 @@ def test_capacity_retries_tombstone_until_warm_vm_is_destroyed(monkeypatch):
     assert p._transitioning_slots == 0
 
 
+#: A connect failure the shared classifier recognises as "the VM is gone".
+_GONE_ERROR = "The sandbox was not found: This error is likely due to sandbox timeout."
+
+
+def test_eviction_of_gone_warm_sandbox_releases_capacity(monkeypatch):
+    """A confirmed-missing remote must free its tombstone and transition slot."""
+    p = _make_provider(replicas=1, overflow_policy="reject")
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+
+    sid = p.acquire("t1", user_id="u1")
+    p.release(sid)
+    assert set(p._warm_pool) == {sid}
+
+    fake_cls.connect_factory = lambda _sid, **_kw: (_ for _ in ()).throw(RuntimeError(_GONE_ERROR))
+
+    assert p._evict_oldest_warm() == sid
+    assert p._eviction_tombstones == set()
+    assert p._evictions_in_progress == set()
+    assert p._transitioning_slots == 0
+
+    # A later pass finds nothing left to release — the slot is freed once.
+    assert p._evict_oldest_warm() is None
+    assert p._transitioning_slots == 0
+
+
+def test_acquire_recovers_capacity_after_gone_warm_eviction(monkeypatch):
+    """Repeated not-found evictions must not exhaust the replica slots forever."""
+    p = _make_provider(replicas=1, overflow_policy="reject")
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+
+    sid1 = p.acquire("t1", user_id="u1")
+    p.release(sid1)
+    fake_cls.connect_factory = lambda _sid, **_kw: (_ for _ in ()).throw(RuntimeError(_GONE_ERROR))
+
+    sid2 = p.acquire("t2", user_id="u2")
+
+    assert sid2 != sid1
+    assert sid2 in p._sandboxes
+    assert p._transitioning_slots == 0
+    assert p._eviction_tombstones == set()
+    assert len(fake_cls.create_calls) == 2
+
+
+def test_reclaim_of_gone_warm_sandbox_releases_transition_slot(monkeypatch):
+    """The reclaim path shares the same confirmed-missing cleanup as eviction."""
+    p = _make_provider(replicas=1, overflow_policy="reject")
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+
+    sid = p.acquire("t1", user_id="u1")
+    p.release(sid)
+    fake_cls.connect_factory = lambda _sid, **_kw: (_ for _ in ()).throw(RuntimeError(_GONE_ERROR))
+
+    assert p._reclaim_warm_pool_sandbox("t1", user_id="u1") is None
+
+    assert p._transitioning_slots == 0
+    assert p._eviction_tombstones == set()
+    assert p._remote_ops_in_progress == set()
+    assert p._warm_pool == {}
+    # The freed slot lets the same thread build a fresh sandbox immediately.
+    assert p.acquire("t1", user_id="u1") != sid
+
+
+def test_eviction_keeps_protection_until_remote_is_confirmed_gone(monkeypatch):
+    """Unconfirmable failures keep the slot; a later confirmed-missing pass releases it."""
+    p = _make_provider(replicas=1, overflow_policy="reject")
+    fake_cls = _install_fake_sdk(monkeypatch, p)
+
+    sid = p.acquire("t1", user_id="u1")
+    p.release(sid)
+    fake_cls.connect_factory = lambda _sid, **_kw: (_ for _ in ()).throw(RuntimeError("network down"))
+
+    with pytest.raises(SandboxCapacityExceededError):
+        p.acquire("t2", user_id="u2")
+    assert p._eviction_tombstones == {sid}
+    assert p._transitioning_slots == 1
+
+    fake_cls.connect_factory = lambda _sid, **_kw: (_ for _ in ()).throw(RuntimeError(_GONE_ERROR))
+
+    sid2 = p.acquire("t2", user_id="u2")
+
+    assert sid2 != sid
+    assert p._eviction_tombstones == set()
+    assert p._transitioning_slots == 0
+
+
+def test_capacity_error_reports_transitioning_slots(monkeypatch):
+    """Capacity errors must expose slots held by in-flight transitions."""
+    wait_provider = _make_provider(replicas=1, overflow_policy="wait", acquire_timeout=0)
+    _install_fake_sdk(monkeypatch, wait_provider)
+    wait_provider._transitioning_slots = 1
+
+    with pytest.raises(SandboxCapacityExceededError) as exc_info:
+        wait_provider.acquire("t1", user_id="u1")
+
+    assert "transitioning=1" in str(exc_info.value)
+    assert exc_info.value.details["transitioning"] == 1
+
+    reject_provider = _make_provider(replicas=1, overflow_policy="reject")
+    _install_fake_sdk(monkeypatch, reject_provider)
+    reject_provider._transitioning_slots = 1
+
+    with pytest.raises(SandboxCapacityExceededError) as reject_info:
+        reject_provider.acquire("t1", user_id="u1")
+
+    assert reject_info.value.details["transitioning"] == 1
+
+    # Zero transitioning slots stay out of the structured details.
+    plain = SandboxCapacityExceededError("no slots", replicas=1)
+    assert "transitioning" not in plain.details
+
+
 def test_tombstone_eviction_has_one_retry_owner(monkeypatch):
     """Only one thread can retry a tombstone at a time."""
     p = _make_provider()
